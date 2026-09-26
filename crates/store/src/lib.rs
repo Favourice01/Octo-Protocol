@@ -581,13 +581,13 @@ impl Store {
 
     /// Atomically swap the sealed seed material for a single wallet after a reseal/key-rotation.
     ///
-    /// The caller (typically `bin/migrate-keys`) opens the old seed with the old master key,
-    /// re-seals it with the new master key via `octo_crypto::reseal`, and then calls this method
-    /// to persist the result. The `expected_scheme` guard ensures idempotency: if the row was
-    /// already migrated (e.g. by a concurrent runner) the update is silently skipped rather than
-    /// overwriting a newer record.
+    /// All four sealed fields are written by **one** `UPDATE`, so a row can never be observed (or
+    /// left after a crash) with a ciphertext from one sealing and a nonce/salt/scheme from
+    /// another. The `expected_old_ciphertext` compare-and-swap makes it idempotent: if the row
+    /// changed since it was read (a concurrent runner, or a re-provisioned gas tank), nothing is
+    /// written. Scheme alone cannot be the guard — a key rotation keeps the scheme at V1.
     ///
-    /// Returns `true` if the row was updated, `false` if it was already on the target scheme.
+    /// Returns `true` if the row was updated, `false` if it no longer held the expected record.
     pub async fn reseal_wallet(
         &self,
         wallet_id: Uuid,
@@ -595,11 +595,8 @@ impl Store {
         new_nonce: &[u8],
         new_salt: &[u8],
         new_scheme: i16,
-        expected_old_scheme: i16,
+        expected_old_ciphertext: &[u8],
     ) -> Result<bool, StoreError> {
-        // Only update the row if it still carries the old scheme — this is the idempotency guard.
-        // A concurrent runner that already migrated this wallet will have set sealed_scheme to
-        // `new_scheme`, so the WHERE clause won't match and no double-reseal can occur.
         let result = sqlx::query(
             r#"
             UPDATE wallets
@@ -609,7 +606,7 @@ impl Store {
                 sealed_scheme      = $5,
                 updated_at         = now()
             WHERE id = $1
-              AND sealed_scheme = $6
+              AND sealed_ciphertext = $6
             "#,
         )
         .bind(wallet_id)
@@ -617,33 +614,29 @@ impl Store {
         .bind(new_nonce)
         .bind(new_salt)
         .bind(new_scheme)
-        .bind(expected_old_scheme)
+        .bind(expected_old_ciphertext)
         .execute(&self.pool)
         .await?;
 
         Ok(result.rows_affected() > 0)
     }
 
-    /// Fetch a page of wallets whose `sealed_scheme` does not equal `target_scheme`, for the
-    /// migration backfill job. Returns at most `batch_size` rows ordered by `id` (stable for
-    /// resumable cursored iteration). Pass the last returned wallet's `id` as `after_id` on
-    /// subsequent calls to page through the full table without re-scanning already-migrated rows.
-    pub async fn list_wallets_needing_reseal(
+    /// Fetch a page of wallets that hold sealed seed material, ordered by `id`, for the
+    /// key-rotation job. Pass the last returned `id` as `after_id` to page through the table.
+    pub async fn list_sealed_wallets(
         &self,
-        target_scheme: i16,
         batch_size: i64,
         after_id: Option<Uuid>,
     ) -> Result<Vec<Wallet>, StoreError> {
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT * FROM wallets
-            WHERE sealed_scheme <> $1
-              AND ($2::uuid IS NULL OR id > $2)
+            WHERE sealed_ciphertext IS NOT NULL
+              AND ($1::uuid IS NULL OR id > $1)
             ORDER BY id
-            LIMIT $3
+            LIMIT $2
             "#,
         )
-        .bind(target_scheme)
         .bind(after_id)
         .bind(batch_size)
         .fetch_all(&self.pool)

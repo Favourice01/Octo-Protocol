@@ -1811,6 +1811,7 @@ dependencies = [
  "dotenvy",
  "octo-crypto",
  "octo-store",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",

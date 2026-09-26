@@ -25,17 +25,16 @@
 //!
 //! ## Idempotency
 //!
-//! The store method `reseal_wallet` only updates a row when its current `sealed_scheme` matches
-//! the expected "old" scheme. Re-running the tool against a fully-migrated database is safe and
-//! produces 0 updates.
+//! A row that already opens under the new key is skipped, and `reseal_wallet` only writes when
+//! the row still holds the ciphertext that was read (compare-and-swap). Re-running the tool
+//! against a fully-migrated database is safe and produces 0 updates. See `lib.rs`.
 //!
 //! ## Rollback
 //!
-//! Old-scheme and new-scheme records can coexist in the database indefinitely because every open
-//! call reads the scheme tag from the row and picks the correct key. To abort a rotation, simply
-//! stop the tool; already-migrated rows remain openable with the new key, un-migrated rows remain
-//! openable with the old key. Rolling back a completed rotation requires running the tool again
-//! with the old and new keys swapped.
+//! Old-key and new-key records can coexist indefinitely: during the rotation window the server
+//! tries `MASTER_KEY_NEXT` first and falls back to `MASTER_KEY` (AES-GCM authentication tells
+//! them apart). To abort, stop the tool. Rolling back a completed rotation means running the tool
+//! again with the old and new keys swapped.
 //!
 //! ## Usage
 //!
@@ -53,9 +52,8 @@
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use octo_crypto::{master_key_from_slice, reseal, MASTER_KEY_LEN, SCHEME_V1};
+use octo_crypto::{master_key_from_slice, MASTER_KEY_LEN};
 use octo_store::Store;
-use uuid::Uuid;
 
 /// Maximum rows per batch (hard cap, configurable via CLI).
 const DEFAULT_BATCH_SIZE: i64 = 100;
@@ -78,87 +76,16 @@ async fn main() -> Result<()> {
         .context("connect to database")?;
     store.migrate().await.context("run migrations")?;
 
-    let mut after_id: Option<Uuid> = None;
-    let mut total_migrated = 0usize;
-    let mut total_skipped = 0usize;
-
-    loop {
-        let batch = store
-            .list_wallets_needing_reseal(SCHEME_V1 as i16, cfg.batch_size, after_id)
-            .await
-            .context("list_wallets_needing_reseal")?;
-
-        if batch.is_empty() {
-            break;
-        }
-
-        tracing::info!(
-            batch_len  = batch.len(),
-            after_id   = ?after_id,
-            "processing batch"
-        );
-
-        for wallet in &batch {
-            // Client-custody wallets hold no server-side seed (the user's key never reaches us),
-            // so there is nothing to reseal. Only rows that actually carry sealed material —
-            // legacy server-custody wallets and gas-tank fee accounts — are rotated.
-            let (Some(ciphertext), Some(nonce), Some(salt), Some(scheme)) = (
-                wallet.sealed_ciphertext.as_ref(),
-                wallet.sealed_nonce.as_ref(),
-                wallet.sealed_salt.as_ref(),
-                wallet.sealed_scheme,
-            ) else {
-                tracing::debug!(wallet_id = %wallet.id, "skipping wallet with no sealed seed");
-                continue;
-            };
-
-            // Build the SealedSeed from the current DB values.
-            let sealed = octo_crypto::SealedSeed::from_parts_with_scheme(
-                ciphertext.clone(),
-                nonce,
-                salt,
-                scheme as u8,
-            )
-            .with_context(|| format!("from_parts wallet {}", wallet.id))?;
-
-            // Context is the network string bound into the AEAD AAD (e.g. "octo:mainnet").
-            let context = format!("octo:{}", wallet.network);
-
-            // reseal: open under old key → re-seal under new key (Zeroizing throughout).
-            let new_sealed = reseal(&cfg.old_key, &cfg.new_key, &sealed, context.as_bytes())
-                .with_context(|| format!("reseal wallet {}", wallet.id))?;
-
-            // Atomically swap the DB record. The idempotency guard (expected_old_scheme)
-            // means a concurrent run that already migrated this wallet is a safe no-op.
-            let updated = store
-                .reseal_wallet(
-                    wallet.id,
-                    &new_sealed.ciphertext,
-                    &new_sealed.nonce,
-                    &new_sealed.salt,
-                    SCHEME_V1 as i16,
-                    scheme,
-                )
-                .await
-                .with_context(|| format!("reseal_wallet DB update for {}", wallet.id))?;
-
-            if updated {
-                total_migrated += 1;
-                tracing::debug!(wallet_id = %wallet.id, "migrated");
-            } else {
-                total_skipped += 1;
-                tracing::debug!(wallet_id = %wallet.id, "skipped (already migrated by concurrent runner)");
-            }
-        }
-
-        // Advance the cursor to the last wallet in this batch (ids are ordered ASC).
-        after_id = batch.last().map(|w| w.id);
-    }
+    let summary =
+        octo_migrate_keys::migrate(&store, &cfg.old_key, &cfg.new_key, cfg.batch_size, |_| {
+            Ok(())
+        })
+        .await?;
 
     tracing::info!(
-        total_migrated,
-        total_skipped,
-        "migration complete — 0 wallets remaining on old scheme"
+        total_migrated = summary.migrated,
+        total_skipped = summary.skipped,
+        "migration complete — every sealed wallet now opens under the new key"
     );
     Ok(())
 }

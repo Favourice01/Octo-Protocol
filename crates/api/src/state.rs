@@ -24,8 +24,8 @@ struct Inner {
     /// AES-256 master key used to seal/open seeds. Held zeroized.
     master_key: Zeroizing<[u8; MASTER_KEY_LEN]>,
     /// Optional next master key present only during a rotation window.
-    /// When set, the server tries this key first (for already-migrated rows) and falls back to
-    /// `master_key` for rows not yet re-sealed by `octo-migrate-keys`.
+    /// When set, the server seals new records under it, tries it first when opening (for
+    /// already-migrated rows), and falls back to `master_key` for rows not yet re-sealed.
     master_key_next: Option<Zeroizing<[u8; MASTER_KEY_LEN]>>,
     network: StellarNetwork,
     horizon: Horizon,
@@ -140,8 +140,8 @@ impl AppState {
     }
 
     /// Set the next master key for zero-downtime key rotation.
-    /// When set, routes select the key based on the `sealed_scheme` of each wallet row:
-    /// already-migrated rows use `master_key_next`; un-migrated rows use `master_key`.
+    /// When set, new records are sealed under it and existing records are opened by trying it
+    /// first, then `master_key` (see [`AppState::opening_keys`]).
     pub fn with_master_key_next(mut self, key: [u8; MASTER_KEY_LEN]) -> Self {
         let inner = Arc::make_mut(&mut self.inner);
         inner.master_key_next = Some(Zeroizing::new(key));
@@ -214,19 +214,27 @@ impl AppState {
         self.inner.master_key_next.as_deref()
     }
 
-    /// Select the correct master key for a wallet given its `sealed_scheme`.
+    /// Key to seal *new* records under: the next key during a rotation window, so fresh rows
+    /// never need migrating; otherwise the current key.
+    pub fn sealing_key(&self) -> &[u8; MASTER_KEY_LEN] {
+        self.inner
+            .master_key_next
+            .as_deref()
+            .unwrap_or(&self.inner.master_key)
+    }
+
+    /// Keys to try when opening a sealed record, newest first.
     ///
-    /// During a rotation window (`MASTER_KEY_NEXT` is set):
-    /// - Rows already migrated to the target scheme use `master_key_next` (the new key).
-    /// - Rows not yet migrated use `master_key` (the old key).
-    ///
-    /// When no next key is configured, always returns `master_key`.
-    pub fn master_key_for_scheme(&self, sealed_scheme: i16) -> &[u8; MASTER_KEY_LEN] {
-        use octo_crypto::SCHEME_V1;
-        match &self.inner.master_key_next {
-            Some(next_key) if sealed_scheme == SCHEME_V1 as i16 => next_key,
-            _ => &self.inner.master_key,
-        }
+    /// Every V1 record carries the same scheme tag whichever key sealed it, so the tag cannot
+    /// pick the key. AES-GCM authentication does: a wrong key fails cleanly, and the caller
+    /// moves on to the next one. Migrated rows open under the next key, un-migrated rows under
+    /// the current one.
+    pub fn opening_keys(&self) -> impl Iterator<Item = &[u8; MASTER_KEY_LEN]> {
+        self.inner
+            .master_key_next
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(&*self.inner.master_key))
     }
 
     pub fn jwt_secret(&self) -> &[u8] {

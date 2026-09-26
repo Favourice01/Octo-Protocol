@@ -112,8 +112,7 @@ pub async fn sponsor(
                 .into(),
         ));
     };
-    // Keep the versioned-scheme path (PR #158) so master-key rotation keeps working. Rows
-    // written before the scheme tag existed fall back to V1.
+    // Rows written before the scheme tag existed fall back to V1.
     let scheme = wallet
         .sealed_scheme
         .unwrap_or(octo_crypto::SCHEME_V1 as i16);
@@ -123,15 +122,13 @@ pub async fn sponsor(
         inner_xdr: &inner_xdr,
         max_base_fee_stroops: max_fee,
     };
-    let signed = match sign_fee_bump(
-        state.master_key_for_scheme(scheme),
-        &sealed,
-        state.network(),
-        0,
-        &fb,
-    ) {
-        Ok(s) => s,
-        Err(_) => {
+    // During a rotation the row may be sealed under either key; AES-GCM tells us which.
+    let signed = match state
+        .opening_keys()
+        .find_map(|key| sign_fee_bump(key, &sealed, state.network(), 0, &fb).ok())
+    {
+        Some(s) => s,
+        None => {
             let _ = state
                 .store()
                 .finalize_sponsored_transaction(reserved.id, "failed", None, Some("signing failed"))
