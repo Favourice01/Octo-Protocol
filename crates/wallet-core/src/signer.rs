@@ -18,9 +18,9 @@ use stellar_base::network::Network;
 // sign_fee_bump (production, not test-gated) rejects sub-minimum fees against this constant.
 use stellar_base::transaction::MIN_BASE_FEE;
 
-// Used only by the feature-gated custodial signing fixtures below.
-#[cfg(any(test, feature = "test-fixtures"))]
+// validate_change_trust (production) checks the issuer strkey.
 use crate::address::is_valid_account;
+// Used only by the feature-gated custodial signing fixtures below.
 #[cfg(any(test, feature = "test-fixtures"))]
 use crate::asset::is_valid_asset_code;
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -230,6 +230,27 @@ pub fn sign_payment(
     })
 }
 
+/// Validate ChangeTrust parameters: asset code, `G...` issuer, and a non-negative limit.
+///
+/// Shared by server-side validation of client-built trustlines and the test-fixture signer, so
+/// both paths accept exactly the same inputs.
+pub fn validate_change_trust(
+    asset_code: &str,
+    asset_issuer: &str,
+    limit_stroops: Option<i64>,
+) -> Result<(), WalletError> {
+    if !crate::asset::is_valid_asset_code(asset_code) {
+        return Err(WalletError::InvalidAssetCode);
+    }
+    if !is_valid_account(asset_issuer) {
+        return Err(WalletError::InvalidAddress);
+    }
+    if limit_stroops.is_some_and(|l| l < 0) {
+        return Err(WalletError::InvalidAmount);
+    }
+    Ok(())
+}
+
 /// A trustline (ChangeTrust) to build and sign from the master account.
 ///
 /// **Test fixture only** since the non-custodial cutover (see [`PaymentRequest`]).
@@ -260,14 +281,7 @@ pub fn sign_change_trust(
     account_index: u32,
     req: &ChangeTrustRequest<'_>,
 ) -> Result<SignedPayment, WalletError> {
-    if let Some(limit) = req.limit_stroops {
-        if limit < 0 {
-            return Err(WalletError::InvalidAmount);
-        }
-    }
-    if !is_valid_account(req.asset_issuer) {
-        return Err(WalletError::InvalidAddress);
-    }
+    validate_change_trust(req.asset_code, req.asset_issuer, req.limit_stroops)?;
 
     let keypair = keypair_from_sealed(master_key, sealed, network, account_index)?;
     let source = keypair.public_key();

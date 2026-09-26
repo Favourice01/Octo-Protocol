@@ -96,16 +96,16 @@ pub fn build_router(state: AppState) -> Router {
                 .get(routes::apikeys::get_key)
                 .delete(routes::apikeys::delete_key),
         )
-        // Custodial signing tombstones (410 Gone since the non-custodial cutover).
+        // Custodial signing tombstone (410 Gone since the non-custodial cutover).
         .route(
             "/v1/wallets/:id/withdraw",
             post(routes::withdrawals::withdraw),
         )
+        // Non-custodial path: clients sign locally and relay through these.
         .route(
             "/v1/wallets/:id/trustlines",
             post(routes::trustlines::add_trustline),
         )
-        // Non-custodial path: clients sign locally and relay through these.
         .route(
             "/v1/wallets/:id/submit-signed",
             post(routes::submit::submit_signed),

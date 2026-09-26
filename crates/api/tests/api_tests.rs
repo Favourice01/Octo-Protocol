@@ -649,32 +649,132 @@ async fn submit_signed_requires_transaction_xdr() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+const TRUSTLINE_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+/// Local mock Horizon serving `GET /accounts/:id` with a fixed sequence, so the trustline success
+/// path runs on every build instead of needing a funded testnet account.
+async fn start_mock_horizon_accounts() -> String {
+    async fn account() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "sequence": "15942562120466433",
+            "balances": [],
+            "subentry_count": 0,
+            "num_sponsoring": 0,
+            "num_sponsored": 0
+        }))
+    }
+    let app = Router::new().route("/accounts/:id", axum::routing::get(account));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
 #[tokio::test]
-async fn custodial_trustline_is_gone() {
+async fn add_trustline_returns_signing_info_for_a_valid_asset() {
+    let Some(url) = database_url() else { return };
+    let store = Store::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let state = AppState::new(
+        store,
+        [42u8; 32],
+        StellarNetwork::Testnet,
+        start_mock_horizon_accounts().await,
+        None,
+        octo_email::EmailSender::new_captured(),
+    );
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    let body = format!(r#"{{"asset_code":"USDC","asset_issuer":"{TRUSTLINE_ISSUER}"}}"#);
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/trustlines"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data = &body_json(resp).await["data"];
+    assert_eq!(data["sequence"], "15942562120466433");
+    assert_eq!(data["asset_code"], "USDC");
+    assert_eq!(data["asset_issuer"], TRUSTLINE_ISSUER);
+    assert_eq!(data["base_fee_stroops"], 100);
+    assert_eq!(
+        data["limit_stroops"],
+        i64::MAX.to_string(),
+        "omitted limit = unlimited"
+    );
+    assert_eq!(
+        data["network_passphrase"],
+        StellarNetwork::Testnet.passphrase()
+    );
+    assert!(data["account"].as_str().unwrap().starts_with('G'));
+    assert_eq!(
+        data["submit_url"],
+        format!("/v1/wallets/{wallet_id}/submit-signed")
+    );
+}
+
+#[tokio::test]
+async fn add_trustline_rejects_an_invalid_asset_code() {
     let Some(state) = test_state().await else {
         return;
     };
     let app = build_router(state.clone());
     let token = auth_token(&app, &state).await;
-    let resp = app
-        .clone()
-        .oneshot(create_wallet_req(&app, &token).await)
-        .await
-        .unwrap();
-    let wallet_id = body_json(resp).await["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/trustlines");
 
+    // Empty code, 13-byte code, bad issuer, negative limit: all rejected before Horizon is hit.
+    for body in [
+        format!(r#"{{"asset_code":"","asset_issuer":"{TRUSTLINE_ISSUER}"}}"#),
+        format!(r#"{{"asset_code":"ABCDEFGHIJKLM","asset_issuer":"{TRUSTLINE_ISSUER}"}}"#),
+        r#"{"asset_code":"USDC","asset_issuer":"not-a-strkey"}"#.to_string(),
+        format!(
+            r#"{{"asset_code":"USDC","asset_issuer":"{TRUSTLINE_ISSUER}","limit_stroops":-1}}"#
+        ),
+        format!(r#"{{"asset_issuer":"{TRUSTLINE_ISSUER}"}}"#),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(post_json_auth(&uri, &body, &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {body}");
+    }
+}
+
+#[tokio::test]
+async fn add_trustline_requires_wallet_authorization() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/trustlines");
+    let body = format!(r#"{{"asset_code":"USDC","asset_issuer":"{TRUSTLINE_ISSUER}"}}"#);
+
+    // No credentials → 401.
+    let unauth = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let resp = app.clone().oneshot(unauth).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Another user must not learn whether this wallet exists → 404.
+    let other = auth_token(&app, &state).await;
     let resp = app
-        .oneshot(post_json_auth(
-            &format!("/v1/wallets/{wallet_id}/trustlines"),
-            r#"{"asset_code":"USDC","asset_issuer":"GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"}"#,
-            &token,
-        ))
+        .oneshot(post_json_auth(&uri, &body, &other))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::GONE);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 /// Regression coverage for the withdrawal route's use of the shared

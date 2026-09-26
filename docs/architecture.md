@@ -51,7 +51,9 @@ The client fetches `GET /signing-info` (sequence, network passphrase, base fee),
 envelope and submits it to Horizon **unmodified** → record + webhook on confirmation. Horizon's
 result codes are passed back so the client can correct and re-sign.
 
-The custodial `POST /withdraw` and `POST /trustlines` endpoints are `410 Gone` tombstones.
+The custodial `POST /withdraw` endpoint is a `410 Gone` tombstone. `POST /trustlines` validates the
+asset and returns ChangeTrust signing info (sequence, passphrase, fee, limit); the client signs
+locally and relays via `submit-signed`.
 
 ## Signing safety
 
