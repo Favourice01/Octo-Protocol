@@ -49,6 +49,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/refresh", post(auth::refresh))
         .route("/v1/auth/me", get(auth::me).patch(auth::update_username))
         .route("/v1/auth/logout", post(auth::logout))
+        .route("/v1/auth/change-password", post(auth::change_password))
         .route("/v1/audit-logs", get(routes::audit::list_audit_logs))
         .route(
             "/v1/uploads/signature",

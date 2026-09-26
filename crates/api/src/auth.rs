@@ -6,11 +6,14 @@
 //!  login/signup ──▶ issues token T1 (7-day TTL)
 //!  POST /refresh   ──▶ revokes T1, issues T2
 //!  POST /logout    ──▶ revokes T2
+//!  POST /change-password ──▶ revokes every token issued so far, issues T3
 //! ```
 //!
-//! Revocation uses a deny-list in Postgres (migration 0008_token_denylist.sql).
-//! Every authenticated request checks the deny-list after signature + expiry verification,
-//! so a revoked token is rejected even within its original TTL window.
+//! Single-token revocation uses a deny-list in Postgres (migration 0008_token_denylist.sql).
+//! Revoking *all* of a user's sessions uses a per-user `session_epoch` (migration
+//! 0021_session_epoch.sql): every JWT carries the epoch it was issued under, and a password
+//! change bumps it. Every authenticated request checks both after signature + expiry
+//! verification, in one query, so a revoked token is rejected even within its original TTL.
 //!
 //! # Refresh atomicity
 //!
@@ -86,6 +89,9 @@ pub struct ResendOtpRequest {
     pub user_id: Option<Uuid>,
 }
 
+/// Change-password attempts allowed per user per 15 minutes.
+const CHANGE_PASSWORD_ATTEMPTS: u32 = 5;
+
 /// Signup-OTP TTL. Matches the wallet-ownership challenge's 10-minute window.
 const OTP_TTL_MINUTES: i64 = 10;
 
@@ -94,6 +100,12 @@ pub struct UserView {
     pub id: Uuid,
     pub email: String,
     pub username: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ChangePasswordRequest {
+    pub current_password: Option<String>,
+    pub new_password: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -113,6 +125,10 @@ pub struct Claims {
     /// and denylisting the old one would revoke the new one too.
     #[serde(default)]
     pub jti: String,
+    /// The user's `session_epoch` at issue time. Pre-epoch tokens decode as 0 (the column
+    /// default), so they stay valid until the user's first password change.
+    #[serde(default)]
+    pub epoch: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +268,7 @@ pub async fn verify_email(
         .send(&user.email, "Welcome to Octo", &welcome_html)
         .await;
 
-    let token = issue_token(state.jwt_secret(), user.id)?;
+    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
     Ok(Envelope::ok(AuthResponse {
         token,
         user: UserView {
@@ -354,7 +370,7 @@ pub async fn login(
     )
     .await;
 
-    let token = issue_token(state.jwt_secret(), user.id)?;
+    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
     Ok(Envelope::ok(
         serde_json::to_value(AuthResponse {
             token,
@@ -418,7 +434,81 @@ pub async fn refresh(
     )
     .await;
 
-    let token = issue_token(state.jwt_secret(), user.id)?;
+    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
+    Ok(Envelope::ok(AuthResponse {
+        token,
+        user: UserView {
+            id: user.id,
+            email: user.email,
+            username: user.username,
+        },
+    }))
+}
+
+/// `POST /v1/auth/change-password` — re-verify the current password, set a new one, revoke every
+/// previously issued session, and return a fresh token (same shape as `refresh`).
+pub async fn change_password(
+    State(state): State<AppState>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<AuthResponse>>> {
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    // API keys are wallet-scoped automation credentials; only a login session may do this.
+    let user_id = require_login(&headers, &state).await?;
+    // Per-user cap too, so a stolen token can't guess the current password by rotating IPs.
+    if !state.rate_limiter().check(
+        &user_id.to_string(),
+        "change_password",
+        CHANGE_PASSWORD_ATTEMPTS,
+        std::time::Duration::from_secs(15 * 60),
+    ) {
+        return Err(ApiError::TooManyRequests(
+            "too many attempts — wait a while and try again".into(),
+        ));
+    }
+
+    let req: ChangePasswordRequest = parse_optional(&body)?;
+    let current = req
+        .current_password
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("current_password is required".into()))?;
+    let new = req
+        .new_password
+        .filter(|p| p.len() >= 8)
+        .ok_or_else(|| ApiError::BadRequest("new_password must be at least 8 characters".into()))?;
+    if new == current {
+        return Err(ApiError::BadRequest(
+            "new_password must differ from the current password".into(),
+        ));
+    }
+
+    let user = state
+        .store()
+        .get_user(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)?;
+    verify_password(&current, &user.password_hash)
+        .map_err(|_| ApiError::BadRequest("current password is incorrect".into()))?;
+
+    let epoch = state
+        .store()
+        .change_password(user_id, &hash_password(&new)?)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    crate::audit::record(
+        &state,
+        user_id,
+        "changed password",
+        crate::audit::category::AUTH,
+        None,
+        &headers,
+    )
+    .await;
+
+    let token = issue_token(state.jwt_secret(), user_id, epoch)?;
     Ok(Envelope::ok(AuthResponse {
         token,
         user: UserView {
@@ -590,11 +680,12 @@ fn b64_decode(input: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-fn issue_token(secret: &[u8], user_id: Uuid) -> Result<String, ApiError> {
+fn issue_token(secret: &[u8], user_id: Uuid, session_epoch: i32) -> Result<String, ApiError> {
     let claims = Claims {
         sub: user_id.to_string(),
         exp: now_secs() + TOKEN_TTL_SECS,
         jti: Uuid::new_v4().to_string(),
+        epoch: session_epoch,
     };
     let payload = serde_json::to_vec(&claims).map_err(|_| ApiError::Internal)?;
     let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
@@ -661,7 +752,8 @@ pub fn hash_token(token: &str) -> String {
 /// Checks, in order:
 /// 1. Presence of the `Authorization: Bearer <token>` header.
 /// 2. Valid HS256 signature and unexpired `exp` claim (`verify_token`).
-/// 3. Token is **not** in the server-side deny-list (populated by `POST /v1/auth/logout`).
+/// 3. Token is **not** in the server-side deny-list (populated by `POST /v1/auth/logout`), and
+///    its `epoch` matches the user's current `session_epoch` (bumped by a password change).
 ///    This adds one database round-trip per authenticated request. The deny-list table is indexed
 ///    on `(token_hash)` (primary key) so the lookup is a single index probe. In practice the
 ///    p99 overhead is well under 1 ms on a co-located Postgres instance; an in-memory cache is
@@ -684,14 +776,13 @@ pub async fn authenticate(
         .parse::<Uuid>()
         .map_err(|_| ApiError::Unauthorized)?;
 
-    // Deny-list check: reject tokens that have been explicitly revoked via logout.
-    let token_hash = hash_token(token);
-    let denied = state
+    // Reject tokens revoked individually (deny-list) or en masse (stale session epoch).
+    let valid = state
         .store()
-        .is_token_denylisted(&token_hash)
+        .is_session_valid(&hash_token(token), user_id, claims.epoch)
         .await
         .map_err(|_| ApiError::Internal)?;
-    if denied {
+    if !valid {
         return Err(ApiError::Unauthorized);
     }
 
@@ -783,6 +874,7 @@ mod tests {
             sub: user_id.to_string(),
             exp,
             jti: Uuid::new_v4().to_string(),
+            epoch: 0,
         };
         let payload = serde_json::to_vec(&claims).expect("Claims always serialize");
         let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
@@ -800,7 +892,7 @@ mod tests {
     #[test]
     fn tampered_signature_byte_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
@@ -823,7 +915,7 @@ mod tests {
     #[test]
     fn tampered_payload_byte_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
@@ -847,7 +939,7 @@ mod tests {
     #[test]
     fn non_standard_header_segment_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
