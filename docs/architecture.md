@@ -77,3 +77,11 @@ server, and it is confined to one crate:
 
 Keys are never written to disk or logs and are never persisted in derived form. Worst-case
 exposure of this key is the gas budget — never customer balances.
+
+### Entropy source (load-bearing)
+Every server-generated mnemonic comes from `WalletSeed::generate` (`wallet-core/src/derive.rs`),
+which fills 128 bits of entropy from `rand::rngs::OsRng` (the OS CSPRNG, `getrandom(2)`) and
+calls `Mnemonic::from_entropy`. It deliberately bypasses tiny-bip39's `Mnemonic::new`, whose
+`thread_rng()` source depends on a default crate feature and a `rand` implementation detail.
+`crypto::seal` uses the same `OsRng` for nonces and salts. Any bump of `tiny-bip39` or `rand`
+must re-confirm this path stays OS-backed.

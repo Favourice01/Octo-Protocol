@@ -1867,6 +1867,7 @@ dependencies = [
  "hex",
  "octo-crypto",
  "proptest",
+ "rand 0.8.6",
  "serde",
  "sha2",
  "slip10_ed25519",

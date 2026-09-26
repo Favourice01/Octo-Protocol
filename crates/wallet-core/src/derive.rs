@@ -9,7 +9,9 @@
 //! so the "real account per customer" model remains available later.
 
 use crate::error::WalletError;
-use bip39::{Language, Mnemonic, MnemonicType, Seed};
+use bip39::{Language, Mnemonic, Seed};
+use rand::rngs::OsRng;
+use rand::RngCore;
 use zeroize::Zeroizing;
 
 /// Stellar's SLIP-0044 coin type.
@@ -18,6 +20,8 @@ const STELLAR_COIN_TYPE: u32 = 148;
 const BIP44_PURPOSE: u32 = 44;
 /// Hardened-derivation offset.
 const HARDENED: u32 = 0x8000_0000;
+/// Entropy for a 12-word BIP39 mnemonic (128 bits).
+const MNEMONIC_ENTROPY_LEN: usize = 16;
 
 /// A BIP39 seed (the 64-byte output of mnemonic + passphrase), zeroized on drop.
 pub struct WalletSeed(Zeroizing<Vec<u8>>);
@@ -28,8 +32,26 @@ impl WalletSeed {
     /// The mnemonic is the **backup secret** — it must be shown to the operator once (for
     /// out-of-band storage) and then only ever persisted in sealed form. It is returned in a
     /// [`Zeroizing`] string so the caller controls its lifetime.
+    ///
+    /// # Entropy source (load-bearing security property)
+    ///
+    /// The 128 bits of mnemonic entropy come from [`rand::rngs::OsRng`] — the operating system's
+    /// CSPRNG (`getrandom(2)` on Linux) — and are passed to [`Mnemonic::from_entropy`]. We do
+    /// **not** call `Mnemonic::new`: in tiny-bip39 2.0.0 that routes through
+    /// `crypto::gen_random_bytes` → `rand::thread_rng()`, a userspace ChaCha12 generator that is
+    /// only reachable when tiny-bip39's default `rand` feature is on and whose algorithm is a
+    /// `rand` implementation detail. Pinning `OsRng` here keeps this guarantee independent of
+    /// either crate's defaults across version bumps.
+    ///
+    /// ```
+    /// use octo_wallet_core::WalletSeed;
+    /// let (a, _) = WalletSeed::generate();
+    /// let (b, _) = WalletSeed::generate();
+    /// assert_eq!(a.split(' ').count(), 12);
+    /// assert_ne!(*a, *b);
+    /// ```
     pub fn generate() -> (Zeroizing<String>, WalletSeed) {
-        let mnemonic = Mnemonic::new(MnemonicType::Words12, Language::English);
+        let mnemonic = fresh_mnemonic();
         let phrase = Zeroizing::new(mnemonic.phrase().to_string());
         let seed = Seed::new(&mnemonic, "");
         let wallet_seed = WalletSeed(Zeroizing::new(seed.as_bytes().to_vec()));
@@ -65,6 +87,17 @@ impl WalletSeed {
         ];
         let key = slip10_ed25519::derive_ed25519_private_key(self.as_bytes(), &path);
         Zeroizing::new(key)
+    }
+}
+
+/// Draw a new 12-word mnemonic from OS entropy (see [`WalletSeed::generate`]).
+fn fresh_mnemonic() -> Mnemonic {
+    let mut entropy = Zeroizing::new([0u8; MNEMONIC_ENTROPY_LEN]);
+    OsRng.fill_bytes(entropy.as_mut());
+    // 16 bytes is a valid BIP39 entropy length, so from_entropy cannot fail here.
+    match Mnemonic::from_entropy(entropy.as_ref(), Language::English) {
+        Ok(m) => m,
+        Err(_) => unreachable!("16-byte entropy is always a valid BIP39 length"),
     }
 }
 
@@ -114,6 +147,19 @@ mod tests {
         let (phrase, seed) = WalletSeed::generate();
         let reimported = WalletSeed::from_phrase(&phrase).unwrap();
         assert_eq!(account_id(&seed, 0), account_id(&reimported, 0));
+    }
+
+    #[test]
+    fn generated_mnemonics_never_collide_across_a_large_sample() {
+        // Smoke test for a broken/constant RNG on generate()'s entropy path (skips slow PBKDF2).
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let phrase = fresh_mnemonic().phrase().to_string();
+            assert!(seen.insert(phrase), "duplicate mnemonic generated");
+        }
+        let (a, _) = WalletSeed::generate();
+        let (b, _) = WalletSeed::generate();
+        assert_ne!(*a, *b);
     }
 
     #[test]
