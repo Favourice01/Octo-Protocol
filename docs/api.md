@@ -35,8 +35,12 @@ server stores only the public account and an opaque, client-encrypted backup blo
 decrypt. Consequently:
 
 - There is **no endpoint that signs a payment for you.** You build and sign locally, then relay.
-- `POST /v1/wallets/:id/withdraw` and `POST /v1/wallets/:id/trustlines` are **`410 Gone`
-  tombstones**. They exist only to give integrators a clear error pointing at `submit-signed`.
+- `POST /v1/wallets/:id/withdraw` is a **`410 Gone` tombstone** pointing integrators at
+  `submit-signed`.
+- `POST /v1/wallets/:id/trustlines` takes `{asset_code, asset_issuer, limit_stroops?}`, validates
+  them, and returns ChangeTrust signing info (`account`, `sequence`, `network_passphrase`,
+  `base_fee_stroops`, `limit_stroops`, `submit_url`). The server never signs it — the client builds
+  and signs the ChangeTrust locally and relays it via `submit-signed`.
 
 ## Wallets
 
