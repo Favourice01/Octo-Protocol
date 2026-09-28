@@ -85,3 +85,21 @@ calls `Mnemonic::from_entropy`. It deliberately bypasses tiny-bip39's `Mnemonic:
 `thread_rng()` source depends on a default crate feature and a `rand` implementation detail.
 `crypto::seal` uses the same `OsRng` for nonces and salts. Any bump of `tiny-bip39` or `rand`
 must re-confirm this path stays OS-backed.
+
+## Wallet Foreign Key Constraints
+
+Wallets are intended to be permanent master records. To prevent accidental cascading deletions or silent orphaned records, all tables referencing `wallets(id)` enforce `ON DELETE RESTRICT`:
+
+| Table | Column | Initial Migration Constraint | Intended & Enforced Constraint |
+| --- | --- | --- | --- |
+| `addresses` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `transactions` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `withdrawals` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `webhook_endpoints` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `ingest_cursor` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `api_keys` | `wallet_id` | `ON DELETE CASCADE` (0005) | `ON DELETE RESTRICT` (0021) |
+| `gas_sponsorship_configs` | `wallet_id` | `ON DELETE CASCADE` (0007) | `ON DELETE RESTRICT` (0021) |
+| `sponsored_transactions` | `wallet_id` | `ON DELETE CASCADE` (0007) | `ON DELETE RESTRICT` (0021) |
+| `withdrawal_allowlist_configs` | `wallet_id` | `ON DELETE CASCADE` (0013) | `ON DELETE RESTRICT` (0021) |
+| `whitelisted_addresses` | `wallet_id` | `ON DELETE CASCADE` (0013) | `ON DELETE RESTRICT` (0021) |
+| `payment_links` | `wallet_id` | `ON DELETE CASCADE` (0014) | `ON DELETE RESTRICT` (0021) |
