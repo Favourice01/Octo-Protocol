@@ -758,7 +758,7 @@ async fn sum_fees_today_can_use_wallet_status_created_at_index() {
            FROM sponsored_transactions
            WHERE wallet_id = $1
              AND status = 'confirmed'
-             AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')"#,
+             AND created_at >= date_trunc('day', now(), 'UTC')"#,
     )
     .bind(wallet_id)
     .fetch_all(&mut *tx)
@@ -850,13 +850,13 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0020.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0021.
     // Guards against silent version collisions — sqlx keys migrations by version, so a repeated
     // number means only one of the colliding pair actually ran.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
-        "expected exactly the twenty known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+        "expected exactly the twenty-one known migrations to be recorded as applied"
     );
 }
 
@@ -1198,5 +1198,154 @@ async fn mark_polled_creates_and_updates_the_cursor_row() {
     assert!(
         token.is_none(),
         "mark_polled must not fabricate a cursor position"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_set_gas_tank_calls_result_in_exactly_one_success() {
+    let Some(store) = store().await else { return };
+    let acct = format!("G{}", Uuid::new_v4().simple());
+    let wallet = store
+        .create_client_wallet(octo_store::NewClientWallet {
+            network: "testnet",
+            stellar_account_g: &acct,
+            encrypted_backup: None,
+            label: Some("gas-tank-race"),
+            user_id: None,
+            description: None,
+        })
+        .await
+        .expect("create client wallet");
+
+    // All callers wait on the barrier so their UPDATEs genuinely overlap.
+    const N: usize = 8;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(N));
+    let tanks: Vec<String> = (0..N)
+        .map(|_| format!("G{}", Uuid::new_v4().simple()))
+        .collect();
+    let handles: Vec<_> = tanks
+        .iter()
+        .cloned()
+        .map(|tank| {
+            let (store, barrier, wallet_id) = (store.clone(), barrier.clone(), wallet.id);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let res = store
+                    .set_gas_tank(wallet_id, &tank, b"ct", b"nonce", b"salt", 1)
+                    .await;
+                (tank, res)
+            })
+        })
+        .collect();
+
+    let mut winners = Vec::new();
+    for h in handles {
+        let (tank, res) = h.await.expect("task");
+        match res {
+            Ok(_) => winners.push(tank),
+            Err(e) => assert!(
+                matches!(e, StoreError::Conflict),
+                "loser must be Conflict: {e:?}"
+            ),
+        }
+    }
+    assert_eq!(winners.len(), 1, "exactly one provisioning call may win");
+
+    // The stored tank must be the winner's, not a blend of racing writes.
+    let stored = store.get_wallet(wallet.id).await.expect("get");
+    assert_eq!(
+        stored.gas_tank_account_g.as_deref(),
+        Some(winners[0].as_str())
+    );
+}
+
+/// Seed a cursor row: last activity `activity_ago` seconds back, last poll `polled_ago` back.
+async fn seed_cursor(store: &Store, id: Uuid, activity_ago: i64, polled_ago: i64) {
+    sqlx::query(
+        "INSERT INTO ingest_cursor (wallet_id, paging_token, updated_at, last_polled_at)
+         VALUES ($1, 'tok', now() - make_interval(secs => $2), now() - make_interval(secs => $3))",
+    )
+    .bind(id)
+    .bind(activity_ago as f64)
+    .bind(polled_ago as f64)
+    .execute(store.pool())
+    .await
+    .expect("seed cursor");
+}
+
+// Tiers: active < 60s since activity, idle wait 100s, dormant >= 300s since activity, wait 100_000s.
+async fn is_due(store: &Store, id: Uuid) -> bool {
+    store
+        .wallets_due_for_poll("testnet", 60, 100, 300, 100_000)
+        .await
+        .expect("due query")
+        .iter()
+        .any(|w| w.id == id)
+}
+
+#[tokio::test]
+async fn wallets_due_for_poll_includes_a_wallet_with_no_cursor_row_at_all() {
+    let Some(store) = store().await else { return };
+    let id = fresh_wallet(&store).await;
+    assert!(
+        is_due(&store, id).await,
+        "never-polled wallet is always due"
+    );
+}
+
+#[tokio::test]
+async fn wallets_due_for_poll_boundary_at_exactly_active_after_secs() {
+    let Some(store) = store().await else { return };
+    let (inside, outside) = (fresh_wallet(&store).await, fresh_wallet(&store).await);
+
+    // Both polled 1s ago; only the tier decides the wait (active: 0s, idle: 100s).
+    seed_cursor(&store, inside, 58, 1).await; // just inside active_after_secs
+    seed_cursor(&store, outside, 62, 1).await; // just outside => idle tier
+
+    assert!(
+        is_due(&store, inside).await,
+        "just-active wallet polls every tick"
+    );
+    assert!(
+        !is_due(&store, outside).await,
+        "just-idle wallet must wait its interval"
+    );
+}
+
+#[tokio::test]
+async fn wallets_due_for_poll_boundary_at_exactly_dormant_after_secs() {
+    let Some(store) = store().await else { return };
+    let (inside, outside) = (fresh_wallet(&store).await, fresh_wallet(&store).await);
+
+    // Both polled 150s ago: past the idle wait (100s), far short of the dormant wait.
+    seed_cursor(&store, inside, 298, 150).await; // just before dormant_after_secs => idle
+    seed_cursor(&store, outside, 302, 150).await; // just past it => dormant
+
+    assert!(
+        is_due(&store, inside).await,
+        "just-idle wallet is due after its interval"
+    );
+    assert!(
+        !is_due(&store, outside).await,
+        "just-dormant wallet must wait the long interval"
+    );
+}
+
+#[tokio::test]
+async fn wallets_due_for_poll_excludes_an_idle_wallet_polled_within_its_interval() {
+    let Some(store) = store().await else { return };
+    let (recent, stale) = (fresh_wallet(&store).await, fresh_wallet(&store).await);
+
+    // Idle tier (200s since activity), 100s interval: 90s ago is too soon, 110s is due.
+    seed_cursor(&store, recent, 200, 90).await;
+    seed_cursor(&store, stale, 200, 110).await;
+
+    assert!(
+        !is_due(&store, recent).await,
+        "polled within its interval => excluded"
+    );
+    assert!(
+        is_due(&store, stale).await,
+        "polled past its interval => due"
     );
 }

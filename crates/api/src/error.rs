@@ -25,12 +25,18 @@ pub enum ApiError {
     NotFound,
     /// 409 — conflict (e.g. duplicate idempotency key / already exists).
     Conflict,
+    /// 409 — a conflict with a specific, actionable message for the client.
+    ConflictWith(String),
     /// 410 — the endpoint was removed (custodial signing paths, post non-custodial cutover).
     Gone(String),
     /// 429 — a rate limit or budget would be exceeded.
     TooManyRequests(String),
+    /// 400 — inner transaction sequence number does not match current on-chain sequence.
+    StaleSequence(String),
     /// 500 — an internal error. The detail is logged, never returned to the client.
     Internal,
+    /// 504 — an upstream dependency (e.g. Horizon) did not answer within the route's time budget.
+    GatewayTimeout(String),
 }
 
 impl ApiError {
@@ -41,12 +47,15 @@ impl ApiError {
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
             ApiError::Conflict => (StatusCode::CONFLICT, "already exists".into()),
+            ApiError::ConflictWith(m) => (StatusCode::CONFLICT, m.clone()),
             ApiError::Gone(m) => (StatusCode::GONE, m.clone()),
             ApiError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m.clone()),
+            ApiError::StaleSequence(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal server error".into(),
             ),
+            ApiError::GatewayTimeout(m) => (StatusCode::GATEWAY_TIMEOUT, m.clone()),
         }
     }
 }
@@ -84,12 +93,16 @@ impl From<octo_wallet_core::WalletError> for ApiError {
         use octo_wallet_core::WalletError as W;
         match e {
             W::InvalidMnemonic
+            | W::InvalidChecksum
             | W::InvalidAddress
             | W::InvalidAssetCode
             | W::InvalidAmount
             | W::InvalidDerivationPath
             | W::InvalidXdr
             | W::InvalidSignature => ApiError::BadRequest("invalid input".into()),
+            W::StaleSequence => ApiError::StaleSequence(
+                "Stale sequence number — refresh signing info and rebuild the transaction.".into(),
+            ),
             W::KeyDerivation | W::Signing | W::SeedDecryption => ApiError::Internal,
         }
     }
