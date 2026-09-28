@@ -118,10 +118,80 @@ so it cannot escalate or revoke itself.
 - `GET    /v1/wallets/{id}/api-key` — metadata (prefix, created_at) — never the key itself.
 - `DELETE /v1/wallets/{id}/api-key` — revoke.
 
+## Payment link checkout flow
+
+A payment link is a shareable, USDC-only checkout page. The merchant creates it once (authenticated);
+every payer step after that is **public — no credential** — and keyed by the link's `slug`. Public
+routes are rate-limited per client IP (per minute): read 60, **intent 5**, signing-info 60,
+submit 20, status 60. Over the limit → `429`.
+
+Merchant, once (dashboard JWT or wallet API key; `$TOKEN` as in the README):
+
+```bash
+curl -s -X POST localhost:8080/v1/wallets/<WALLET_ID>/payment-links \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"name":"Order #1042","amount_usdc_stroops":50000000}' | jq   # omit the amount for a flexible link
+# -> data.slug (e.g. "3f9c1a7d2e"), data.url (hosted checkout page)
+```
+
+Payer, from there (`$SLUG` is `data.slug`; a fixed-amount link ignores any amount the payer sends,
+a flexible link requires `amount_usdc_stroops > 0`):
+
+```bash
+# 1. Fetch the link: what is being paid and where. 404 if the slug is unknown or the link is inactive.
+curl -s localhost:8080/v1/pay/$SLUG | jq
+# -> { name, description, image_url, redirect_url, amount_usdc_stroops, deposit_address, asset_code: "USDC" }
+
+# 2. Create a payment intent. Each intent gets its OWN muxed deposit address, so a deposit maps to
+#    exactly one payment. payer_name / payer_email are optional.
+curl -s -X POST localhost:8080/v1/pay/$SLUG/intent \
+  -H 'content-type: application/json' -d '{"payer_name":"Ada","payer_email":"ada@example.com"}' | jq
+# -> 201 { payment_id, deposit_address, amount_usdc_stroops }   (keep payment_id)
+
+# 3. Get what you need to build the transaction. `account` is the PAYER's own G... account, so the
+#    returned sequence is the payer's. Omit it and the merchant wallet's account is used.
+#    A payer account that does not exist on the network yet (unfunded) returns 404.
+curl -s "localhost:8080/v1/pay/$SLUG/signing-info?account=<PAYER_G_ADDRESS>" | jq
+# -> { account, sequence, network_passphrase, base_fee_stroops }
+
+# 4. Build and SIGN LOCALLY (e.g. in Freighter): exactly one USDC Payment to the intent's
+#    deposit_address, nothing else. Then relay it, passing the payment_id from step 2.
+curl -s -X POST localhost:8080/v1/pay/$SLUG/submit-signed \
+  -H 'content-type: application/json' \
+  -d '{"transaction_xdr":"<BASE64_SIGNED_XDR>","payment_id":"<PAYMENT_ID>"}' | jq
+# -> 201 { status: "confirmed" | "failed", stellar_tx_hash, detail }
+
+# 5. Poll until the deposit is matched (the pay page polls about every 3s).
+curl -s localhost:8080/v1/pay/$SLUG/payments/<PAYMENT_ID> | jq
+# -> { status, transaction_id, expected_usdc_stroops, received_usdc_stroops }
+```
+
+Things an integrator should know:
+
+- **`submit-signed` returns `201` even when `status` is `"failed"`** — check `status` and `detail`
+  (a Horizon result code such as `op_underfunded`), not just the HTTP code. `400` means the
+  transaction was rejected before relay: not a v1 envelope, unsigned, or not exactly one USDC
+  `Payment` to this intent's `deposit_address`.
+- **The relay is deliberately narrow**: it never signs and cannot spend anything except that one
+  payment. Without `payment_id` it falls back to the link's own address (legacy clients).
+- **Status** is one of `pending`, `confirmed`, `expired`, `underpaid`, `overpaid`. `received_usdc_stroops`
+  is `null` until a deposit is matched; `expected_usdc_stroops` is always present so a client can
+  show "you sent X, expected Y". A `confirmed` status comes from the ingest worker seeing the
+  deposit, not from the submit response.
+- **Payer PII is write-only.** `payer_name` and `payer_email` are stored for the merchant but no
+  public route returns them, and none of the public responses above carries merchant-internal
+  fields (wallet id, link id, collected totals). If a public response ever gains or loses a field,
+  update the shapes shown here.
+- Amounts are integer stroops: `50000000` = 5 USDC.
+
+Merchant-side management (list/get/deactivate links and list a link's payments) lives under
+`/v1/wallets/{id}/payment-links` — see [openapi.yaml](openapi.yaml).
+
 ## Audit logs
 
 - `GET /v1/audit-logs` — your account's activity, filterable by `category` and a free-text
-  `search`. Valid categories: `authentication`, `wallet`, `address`, `credentials`, `configuration`, `sponsorship`.
+  `search`. Valid categories: `authentication`, `wallet`, `address`, `credentials`, `configuration`, `sponsorship`. The category set and every event that emits one is catalogued in
+  [audit-log.md](audit-log.md).
 
 ## Conventions
 

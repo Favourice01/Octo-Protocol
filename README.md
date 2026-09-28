@@ -102,7 +102,9 @@ curl -s -X POST localhost:8080/v1/wallets/<WALLET_ID>/submit-signed \
 ```
 
 See [docs/non-custodial-flow.md](docs/non-custodial-flow.md) for the full
-build → sign → relay sequence.
+build → sign → relay sequence. Accepting payments via a shareable link is walked through in
+[docs/api.md](docs/api.md#payment-link-checkout-flow); account activity categories are in
+[docs/audit-log.md](docs/audit-log.md).
 
 ## Security architecture
 
