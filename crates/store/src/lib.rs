@@ -190,6 +190,28 @@ impl Store {
         Ok(())
     }
 
+    /// Replace a user's password hash and bump `session_epoch`, revoking every issued token.
+    /// Returns the new epoch to embed in the replacement session token.
+    pub async fn change_password(
+        &self,
+        user_id: Uuid,
+        new_password_hash: &str,
+    ) -> Result<i32, StoreError> {
+        sqlx::query_scalar(
+            r#"
+            UPDATE users
+            SET password_hash = $2, session_epoch = session_epoch + 1, updated_at = now()
+            WHERE id = $1
+            RETURNING session_epoch
+            "#,
+        )
+        .bind(user_id)
+        .bind(new_password_hash)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)
+    }
+
     // --- email OTP ----------------------------------------------------------
 
     /// Issue a fresh OTP row. Callers hash the code themselves before calling this.
@@ -2014,6 +2036,30 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         Ok(found.is_some())
+    }
+
+    /// One-round-trip session check: the user still exists at `session_epoch` and the token
+    /// hash is not deny-listed. Used on every authenticated request.
+    pub async fn is_session_valid(
+        &self,
+        token_hash: &str,
+        user_id: Uuid,
+        session_epoch: i32,
+    ) -> Result<bool, StoreError> {
+        let valid: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (SELECT 1 FROM users WHERE id = $2 AND session_epoch = $3)
+               AND NOT EXISTS (
+                   SELECT 1 FROM token_denylist WHERE token_hash = $1 AND expires_at > now()
+               )
+            "#,
+        )
+        .bind(token_hash)
+        .bind(user_id)
+        .bind(session_epoch)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(valid)
     }
 
     // --- ingest cursor ----------------------------------------------------

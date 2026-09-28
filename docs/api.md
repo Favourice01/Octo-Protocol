@@ -26,6 +26,9 @@ deny-list the presented token, and every authenticated request checks that deny-
 - `POST /v1/auth/login` — returns a JWT.
 - `POST /v1/auth/refresh` — issue a new token **and revoke the presented one**.
 - `POST /v1/auth/logout` — revoke the presented token (a second logout is `401`, not `200`).
+- `POST /v1/auth/change-password` — `{current_password, new_password}`; re-verifies the current
+  password, revokes **every** session issued before the change (per-user `session_epoch`), and
+  returns a fresh token. Login-JWT only (not API keys); rate-limited per IP and per user.
 - `GET  /v1/auth/me` — the current user.
 
 ## Custody model — read this before the wallet endpoints

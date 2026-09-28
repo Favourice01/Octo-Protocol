@@ -113,6 +113,8 @@ pub struct User {
     pub email_verified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Bumped on password change; JWTs carrying an older epoch are rejected.
+    pub session_epoch: i32,
 }
 
 /// A registered webhook endpoint.
