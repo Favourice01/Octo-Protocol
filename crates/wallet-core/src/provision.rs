@@ -55,7 +55,7 @@ pub fn import_wallet(
 
 /// Derive the `G...` account id for master account 0 from a seed.
 fn master_account_id(seed: &WalletSeed) -> Result<String, WalletError> {
-    let secret = seed.derive_ed25519_secret(0);
+    let secret = seed.derive_ed25519_secret(0)?;
     let kp =
         DalekKeyPair::from_seed_bytes(secret.as_ref()).map_err(|_| WalletError::KeyDerivation)?;
     Ok(kp.public_key().account_id())

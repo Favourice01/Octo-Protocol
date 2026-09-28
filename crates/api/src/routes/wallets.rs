@@ -13,14 +13,25 @@ use octo_wallet_core::is_valid_account;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Shared pagination query parameters used by list_wallets, list_transactions,
-/// and list_addresses. Mirrors `SponsoredTxnQuery`'s limit/before convention.
+/// Shared pagination query parameters used by list_wallets and list_addresses.
+/// Mirrors `SponsoredTxnQuery`'s limit/before convention.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListParams {
     /// Maximum rows to return (default 50, max 200).
     pub limit: Option<i64>,
     /// Cursor: return rows created before this id (exclusive).
     pub before: Option<Uuid>,
+}
+
+/// Query parameters for `list_transactions`: supports pagination and direction filter.
+#[derive(Debug, Default, Deserialize)]
+pub struct TransactionListParams {
+    /// Maximum rows to return (default 50, max 200).
+    pub limit: Option<i64>,
+    /// Cursor: return rows created before this id (exclusive).
+    pub before: Option<Uuid>,
+    /// Filter by direction: deposit | withdrawal.
+    pub direction: Option<String>,
 }
 
 /// Body for wallet creation. Non-custodial: the client generates the keypair and sends only the
@@ -171,6 +182,12 @@ pub fn validated_limit(limit: Option<i64>) -> Result<i64, ApiError> {
 }
 
 /// `POST /v1/wallets` — create a master wallet for the authenticated user.
+///
+/// Ownership invariant: client-custody wallet registration strictly enforces cryptographic
+/// ownership verification before creating or activating the wallet row. Every call must provide
+/// a server-issued challenge (from `GET /v1/wallets/challenge`) and a valid Ed25519 signature
+/// matching `public_key`. The signature is verified inline via `verify_ownership` prior to any
+/// database insertion, preventing unverified or spoofed public keys from being registered.
 pub async fn create_wallet(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -367,22 +384,33 @@ pub async fn get_balances(
 }
 
 /// `GET /v1/wallets/{id}/transactions` — recorded deposits/withdrawals for a wallet,
-/// with optional `?limit=` and `?before=` cursor pagination.
+/// with optional `?limit=`, `?before=` cursor pagination, and `?direction=` filter.
 pub async fn list_transactions(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Query(q): Query<ListParams>,
+    Query(q): Query<TransactionListParams>,
 ) -> ApiResult<Json<Envelope<TransactionListResponse>>> {
     authorize_wallet(&headers, &state, id).await?;
     let _ = state.store().get_wallet(id).await?;
+
+    let direction = match q.direction.as_deref() {
+        Some("deposit") => Some("deposit"),
+        Some("withdrawal") => Some("withdrawal"),
+        None => None,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "invalid direction filter '{other}'; valid values are: deposit, withdrawal"
+            )));
+        }
+    };
 
     let limit = validated_limit(q.limit)?;
 
     // Fetch limit+1 to detect whether a next page exists.
     let rows = state
         .store()
-        .list_transactions(id, limit + 1, q.before)
+        .list_transactions_page(id, limit + 1, direction, q.before)
         .await
         .map_err(|_| ApiError::Internal)?;
 

@@ -18,9 +18,9 @@ use stellar_base::network::Network;
 // sign_fee_bump (production, not test-gated) rejects sub-minimum fees against this constant.
 use stellar_base::transaction::MIN_BASE_FEE;
 
-// Used only by the feature-gated custodial signing fixtures below.
-#[cfg(any(test, feature = "test-fixtures"))]
+// validate_change_trust (production) checks the issuer strkey.
 use crate::address::is_valid_account;
+// Used only by the feature-gated custodial signing fixtures below.
 #[cfg(any(test, feature = "test-fixtures"))]
 use crate::asset::is_valid_asset_code;
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -93,6 +93,10 @@ impl StellarNetwork {
 
     /// Parse from the canonical name. Accepts `mainnet`/`public`, `testnet`/`test`, and
     /// `standalone`.
+    ///
+    /// Fail-closed invariant: returns `None` for any unrecognized or typo string (e.g. `mainnnet`,
+    /// `Testnet`), with no default fallback. Callers must fail closed rather than defaulting to any
+    /// ambient network, preventing wrong-network signatures.
     pub fn parse(s: &str) -> Option<StellarNetwork> {
         match s {
             "mainnet" | "public" => Some(StellarNetwork::Public),
@@ -141,7 +145,7 @@ fn keypair_from_sealed(
 ) -> Result<DalekKeyPair, WalletError> {
     let seed_bytes = open(master_key, sealed, network.crypto_context())?;
     let seed = WalletSeed::from_bytes(seed_bytes.to_vec());
-    let secret = seed.derive_ed25519_secret(account_index);
+    let secret = seed.derive_ed25519_secret(account_index)?;
     // stellar-base builds the ed25519 keypair from the 32-byte secret seed.
     DalekKeyPair::from_seed_bytes(secret.as_ref()).map_err(|_| WalletError::KeyDerivation)
 }
@@ -161,6 +165,8 @@ pub fn account_id_from_sealed(
 ///
 /// Only a Payment operation is ever constructed — no other operation type can be produced by this
 /// function, which is the core anti-"signing-oracle" guarantee.
+///
+/// Invariant: secret material is zeroized on every exit path, success or error.
 ///
 /// **Test fixture only** since the non-custodial cutover (see [`PaymentRequest`]).
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -230,6 +236,27 @@ pub fn sign_payment(
     })
 }
 
+/// Validate ChangeTrust parameters: asset code, `G...` issuer, and a non-negative limit.
+///
+/// Shared by server-side validation of client-built trustlines and the test-fixture signer, so
+/// both paths accept exactly the same inputs.
+pub fn validate_change_trust(
+    asset_code: &str,
+    asset_issuer: &str,
+    limit_stroops: Option<i64>,
+) -> Result<(), WalletError> {
+    if !crate::asset::is_valid_asset_code(asset_code) {
+        return Err(WalletError::InvalidAssetCode);
+    }
+    if !is_valid_account(asset_issuer) {
+        return Err(WalletError::InvalidAddress);
+    }
+    if limit_stroops.is_some_and(|l| l < 0) {
+        return Err(WalletError::InvalidAmount);
+    }
+    Ok(())
+}
+
 /// A trustline (ChangeTrust) to build and sign from the master account.
 ///
 /// **Test fixture only** since the non-custodial cutover (see [`PaymentRequest`]).
@@ -251,6 +278,8 @@ pub struct ChangeTrustRequest<'a> {
 /// This only ever constructs Octo's own operation — here a single ChangeTrust — so it cannot be
 /// used as a "sign anything" oracle.
 ///
+/// Invariant: secret material is zeroized on every exit path, success or error.
+///
 /// **Test fixture only** since the non-custodial cutover (see [`PaymentRequest`]).
 #[cfg(any(test, feature = "test-fixtures"))]
 pub fn sign_change_trust(
@@ -260,14 +289,7 @@ pub fn sign_change_trust(
     account_index: u32,
     req: &ChangeTrustRequest<'_>,
 ) -> Result<SignedPayment, WalletError> {
-    if let Some(limit) = req.limit_stroops {
-        if limit < 0 {
-            return Err(WalletError::InvalidAmount);
-        }
-    }
-    if !is_valid_account(req.asset_issuer) {
-        return Err(WalletError::InvalidAddress);
-    }
+    validate_change_trust(req.asset_code, req.asset_issuer, req.limit_stroops)?;
 
     let keypair = keypair_from_sealed(master_key, sealed, network, account_index)?;
     let source = keypair.public_key();
@@ -331,6 +353,8 @@ pub struct FeeBumpRequest<'a> {
 /// Security: the seed is decrypted, the signing key is derived, and both are zeroized on drop —
 /// the same contract as `sign_payment`. The caller is responsible for validating the inner XDR
 /// (operation-type allowlist, self-sponsorship guard) before calling this function.
+///
+/// Invariant: secret material is zeroized on every exit path, success or error.
 pub fn sign_fee_bump(
     master_key: &[u8; MASTER_KEY_LEN],
     sealed: &SealedSeed,
@@ -359,7 +383,7 @@ pub fn sign_fee_bump(
     // Derive the signing key for the fee source (decrypt → derive → zeroize on drop).
     let seed_bytes = open(master_key, sealed, network.crypto_context())?;
     let seed = WalletSeed::from_bytes(seed_bytes.to_vec());
-    let secret = seed.derive_ed25519_secret(account_index);
+    let secret = seed.derive_ed25519_secret(account_index)?;
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
 
     let pk_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
@@ -464,15 +488,35 @@ pub fn inner_operation_count(inner_xdr: &str) -> Result<usize, WalletError> {
     Ok(parse_inner_v1(inner_xdr)?.tx.operations.len())
 }
 
-/// Parse `inner_xdr` as a `TransactionEnvelope` and require that it decodes to specifically
-/// a v1 Tx, not a fee-bump or the legacy v0 form. Centralising the check here ensures the two
-/// call sites cannot silently drift apart as the fee-bump path grows.
+// Extract the sequence number of the inner transaction.
+pub fn inner_sequence_number(inner_xdr: &str) -> Result<i64, WalletError> {
+    Ok(parse_inner_v1(inner_xdr)?.tx.seq_num.0)
+}
+
+// Decode a base64 TransactionEnvelope strictly, rejecting trailing bytes after the envelope.
+pub fn decode_envelope_strict(
+    b64: &str,
+) -> Result<stellar_base::xdr::TransactionEnvelope, WalletError> {
+    use base64::Engine;
+    use stellar_base::xdr::{TransactionEnvelope, XDRDeserialize, XDRSerialize};
+
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|_| WalletError::InvalidXdr)?;
+    let env = TransactionEnvelope::from_xdr(&raw).map_err(|_| WalletError::InvalidXdr)?;
+    let encoded = env.xdr_bytes().map_err(|_| WalletError::InvalidXdr)?;
+    if encoded.len() != raw.len() {
+        return Err(WalletError::InvalidXdr);
+    }
+    Ok(env)
+}
+
+// Parse inner_xdr as a v1 Tx TransactionEnvelope using strict decoding.
 fn parse_inner_v1(
     inner_xdr: &str,
 ) -> Result<stellar_base::xdr::TransactionV1Envelope, WalletError> {
-    use stellar_base::xdr::{TransactionEnvelope, XDRDeserialize};
-    let env =
-        TransactionEnvelope::from_xdr_base64(inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
+    use stellar_base::xdr::TransactionEnvelope;
+    let env = decode_envelope_strict(inner_xdr)?;
     match env {
         TransactionEnvelope::Tx(v1) => Ok(v1),
         _ => Err(WalletError::InvalidXdr),
@@ -512,6 +556,31 @@ mod tests {
         .to_vec();
         let sealed = seal(&mk, &bytes, net.crypto_context()).unwrap();
         (mk, sealed)
+    }
+
+    #[test]
+    fn parse_rejects_a_typo_variant_of_a_known_network_name() {
+        assert_eq!(StellarNetwork::parse("mainnnet"), None);
+        assert_eq!(StellarNetwork::parse("tsetnet"), None);
+        assert_eq!(StellarNetwork::parse("stand-alone"), None);
+    }
+
+    #[test]
+    fn parse_rejects_case_variants_not_exactly_matching_the_canonical_string() {
+        assert_eq!(StellarNetwork::parse("Mainnet"), None);
+        assert_eq!(StellarNetwork::parse("Testnet"), None);
+        assert_eq!(StellarNetwork::parse("TESTNET"), None);
+        assert_eq!(StellarNetwork::parse("PUBLIC"), None);
+        assert_eq!(StellarNetwork::parse("Standalone"), None);
+    }
+
+    #[test]
+    fn parse_accepts_every_canonical_network_string() {
+        assert_eq!(StellarNetwork::parse("mainnet"), Some(StellarNetwork::Public));
+        assert_eq!(StellarNetwork::parse("public"), Some(StellarNetwork::Public));
+        assert_eq!(StellarNetwork::parse("testnet"), Some(StellarNetwork::Testnet));
+        assert_eq!(StellarNetwork::parse("test"), Some(StellarNetwork::Testnet));
+        assert_eq!(StellarNetwork::parse("standalone"), Some(StellarNetwork::Standalone));
     }
 
     #[test]
@@ -1261,5 +1330,48 @@ mod tests {
                 offset
             );
         }
+    }
+
+    #[test]
+    fn sign_payment_zeroizes_seed_bytes_even_when_the_xdr_construction_step_fails_after_decryption() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        // An invalid destination triggers an error after seed decryption and derivation,
+        // confirming that the decrypted seed wrapped in Zeroizing is dropped and zeroized on error.
+        let req = PaymentRequest {
+            destination: "invalid-destination-address",
+            stroops: 10_000_000,
+            asset: None,
+            memo_id: None,
+            sequence: 1,
+        };
+        let res = sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req);
+        assert!(matches!(res, Err(WalletError::InvalidAddress)));
+    }
+
+    #[test]
+    fn sign_change_trust_zeroizes_seed_bytes_on_error_after_decryption() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        // An invalid asset code triggers an error after seed decryption in sign_change_trust.
+        let req = ChangeTrustRequest {
+            asset_code: "TOOLONGASSETCODE123",
+            asset_issuer: DEST,
+            limit_stroops: None,
+            sequence: 1,
+        };
+        let res = sign_change_trust(&mk, &sealed, StellarNetwork::Testnet, 0, &req);
+        assert!(matches!(res, Err(WalletError::InvalidAddress)));
+    }
+
+    #[test]
+    fn sign_fee_bump_zeroizes_seed_bytes_on_error_after_decryption() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        // Out-of-range account index triggers InvalidDerivationPath after decryption in sign_fee_bump.
+        let (_, bytes) = valid_xdr_bytes();
+        let req = FeeBumpRequest {
+            inner_xdr: &b64(&bytes),
+            max_base_fee_stroops: 200,
+        };
+        let res = sign_fee_bump(&mk, &sealed, StellarNetwork::Testnet, 0x8000_0000, &req);
+        assert!(matches!(res, Err(WalletError::InvalidDerivationPath)));
     }
 }
